@@ -1,0 +1,319 @@
+name: Build release binaries
+
+# Builds standalone nextpnr binaries (ice40, ecp5, generic) for Windows, Linux
+# and macOS (x86_64 + arm64).
+#
+# Strategy: the per-architecture chip databases are compiled from IceStorm /
+# Trellis into portable `.bba` files *once* on Linux (`chipdb` job). Every
+# platform then builds nextpnr with `-DIMPORT_BBA_FILES`, so Windows/macOS do
+# not need IceStorm, Trellis or the compiled pytrellis module at all.
+#
+# Run manually via "Run workflow", or push a tag like `v0.1` to also publish a
+# GitHub Release with the archives attached.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned to the same revisions as the arch CI, for reproducible chipdbs.
+  ICESTORM_REVISION: 68044cc4dac829729ccd0ee88d0780525b515746
+  TRELLIS_REVISION: 36c615d1740473cc3574464c7f0bed44da20e5b6
+  # Architectures baked into the release binaries.
+  ARCHES: "ice40;ecp5;generic"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Generate portable chip databases (.bba) on Linux.
+  # ---------------------------------------------------------------------------
+  chipdb:
+    name: Generate chipdbs
+    runs-on: ubuntu-22.04
+    env:
+      DEPS_PATH: ${{ github.workspace }}/deps
+    steps:
+      - uses: actions/checkout@v4
+
+      # The generated chipdbs only depend on the arch list and the pinned
+      # IceStorm/Trellis revisions, so cache the whole set. On a hit we skip
+      # building IceStorm/Trellis and regenerating entirely.
+      - name: Cache generated chipdbs
+        uses: actions/cache@v4
+        id: cache-chipdbs
+        with:
+          path: chipdbs
+          key: chipdbs-ice40-ecp5-generic-ice${{ env.ICESTORM_REVISION }}-tr${{ env.TRELLIS_REVISION }}-v1
+
+      # NOTE: deliberately NOT using actions/setup-python here. Trellis builds a
+      # compiled `pytrellis` module against the system Python; the ecp5 chipdb
+      # generator imports it, so the interpreter that CMake picks must be the
+      # exact same system Python. A mismatched setup-python would break `import
+      # pytrellis` at generation time.
+      - name: Install build dependencies
+        if: steps.cache-chipdbs.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          # libftdi-dev is needed by IceStorm's iceprog tool (built as part of
+          # `make`); the rest is for building Trellis and generating chipdbs.
+          sudo apt-get install -y --no-install-recommends \
+            git make cmake g++ libboost-all-dev libeigen3-dev \
+            python3 python3-dev zlib1g-dev libftdi-dev
+
+      - name: Cache IceStorm
+        if: steps.cache-chipdbs.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        id: cache-icestorm
+        with:
+          path: .icestorm
+          key: release-icestorm-${{ env.ICESTORM_REVISION }}
+
+      - name: Build IceStorm
+        if: steps.cache-chipdbs.outputs.cache-hit != 'true' && steps.cache-icestorm.outputs.cache-hit != 'true'
+        run: |
+          source ./.github/ci/build_common.sh
+          build_icestorm
+
+      - name: Cache Trellis
+        if: steps.cache-chipdbs.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        id: cache-trellis
+        with:
+          path: .trellis
+          key: release-trellis-${{ env.TRELLIS_REVISION }}
+
+      - name: Build Trellis
+        if: steps.cache-chipdbs.outputs.cache-hit != 'true' && steps.cache-trellis.outputs.cache-hit != 'true'
+        run: |
+          source ./.github/ci/build_common.sh
+          build_trellis
+
+      - name: Generate .bba chip databases
+        if: steps.cache-chipdbs.outputs.cache-hit != 'true'
+        run: |
+          # NB: use a dedicated directory name (not "bba", which already exists
+          # in the source tree as the bbasm tool) to avoid a path collision.
+          mkdir -p "${GITHUB_WORKSPACE}/chipdbs/ice40" "${GITHUB_WORKSPACE}/chipdbs/ecp5"
+          cmake -B build-bba \
+            -DARCH="${ARCHES}" \
+            -DBUILD_PYTHON=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DICESTORM_INSTALL_PREFIX="${GITHUB_WORKSPACE}/.icestorm" \
+            -DTRELLIS_INSTALL_PREFIX="${GITHUB_WORKSPACE}/.trellis" \
+            -DEXPORT_BBA_FILES="${GITHUB_WORKSPACE}/chipdbs"
+          cmake --build build-bba --target nextpnr-all-bba -j"$(nproc)"
+
+      - name: Show generated chipdbs
+        run: find chipdbs -type f | sort
+
+      - name: Upload chipdbs
+        uses: actions/upload-artifact@v4
+        with:
+          name: chipdb-bba
+          path: chipdbs/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 2. Build the release binaries on every platform.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.name }}
+    needs: chipdb
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: macos-arm64
+            os: macos-14
+          - name: windows-x86_64
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download chipdbs
+        uses: actions/download-artifact@v4
+        with:
+          name: chipdb-bba
+          path: chipdbs
+
+      # --- Dependencies -----------------------------------------------------
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # bz2/lzma dev packages provide the static archives that the static
+          # Boost.Iostreams library pulls in when fully static-linking.
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libboost-all-dev libeigen3-dev \
+            zlib1g-dev libbz2-dev liblzma-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        # zstd, xz (liblzma) and icu4c are pulled in transitively by Homebrew's
+        # static Boost at link time; install them explicitly so the dylibs exist.
+        run: brew install boost eigen zstd xz icu4c
+
+      - name: Cache vcpkg binaries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-x64-static-boost-eigen-v1
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
+            boost-program-options:x64-windows-static `
+            boost-iostreams:x64-windows-static `
+            boost-thread:x64-windows-static `
+            eigen3:x64-windows-static
+
+      # --- Configure --------------------------------------------------------
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DARCH="${ARCHES}" \
+            -DBUILD_PYTHON=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DSTATIC_BUILD=ON \
+            -DUSE_IPO=OFF \
+            -DIMPORT_BBA_FILES="${GITHUB_WORKSPACE}/chipdbs"
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Homebrew's static Boost references compression/ICU libraries via bare
+          # -l flags with no path. Some of those (e.g. icu4c) are keg-only and
+          # live under opt/<pkg>/lib, so add every Homebrew keg lib dir to the
+          # linker search path rather than chasing them one by one.
+          LDIRS="-L$(brew --prefix)/lib"
+          for d in "$(brew --prefix)"/opt/*/lib; do
+            [ -d "$d" ] && LDIRS="$LDIRS -L$d"
+          done
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DARCH="${ARCHES}" \
+            -DBUILD_PYTHON=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DSTATIC_BUILD=ON \
+            -DUSE_IPO=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="$LDIRS" \
+            -DIMPORT_BBA_FILES="${GITHUB_WORKSPACE}/chipdbs"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        # Don't use the project's STATIC_BUILD (its /MT flag munging predates
+        # CMP0091 and only reaches some targets, so bbasm links with /MD and
+        # clashes with static-CRT Boost). Instead drive the CRT the modern way:
+        # x64-windows-static (static Boost) + MultiThreaded runtime for all
+        # targets. Result is a fully static, dependency-free .exe.
+        run: |
+          cmake -B build \
+            -DARCH="${ARCHES}" \
+            -DBUILD_PYTHON=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DUSE_IPO=OFF \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DIMPORT_BBA_FILES="${GITHUB_WORKSPACE}/chipdbs" \
+            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static
+
+      # --- Build ------------------------------------------------------------
+      - name: Build
+        run: cmake --build build --config Release -j 3
+
+      # --- Package ----------------------------------------------------------
+      - name: Strip binaries (Unix)
+        if: runner.os != 'Windows'
+        # Release flags include -g on Linux, so the unstripped binaries carry
+        # large debug sections. Strip them to shrink the download substantially.
+        run: strip build/nextpnr-ice40 build/nextpnr-ecp5 build/nextpnr-generic
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          STAGE="nextpnr-${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BINDIR="build/Release"; EXT=".exe"
+          else
+            BINDIR="build"; EXT=""
+          fi
+          for arch in ice40 ecp5 generic; do
+            cp "$BINDIR/nextpnr-$arch$EXT" "$STAGE/"
+          done
+          cp COPYING README.md "$STAGE/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cmake -E tar cf "$STAGE.zip" --format=zip "$STAGE"
+            echo "ASSET=$STAGE.zip" >> "$GITHUB_ENV"
+          else
+            cmake -E tar czf "$STAGE.tar.gz" "$STAGE"
+            echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Smoke test binaries
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then BINDIR="build/Release"; EXT=".exe"; else BINDIR="build"; EXT=""; fi
+          "$BINDIR/nextpnr-ice40$EXT" --version
+          "$BINDIR/nextpnr-ecp5$EXT" --version
+          "$BINDIR/nextpnr-generic$EXT" --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextpnr-${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish a GitHub Release when a tag is pushed.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: nextpnr-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
